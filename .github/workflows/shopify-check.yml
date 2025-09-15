@@ -11,18 +11,6 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install dependencies (none required)
-        run: |
-          node -v
-
       - name: Count Shopify products via Storefront API
         id: count
         env:
