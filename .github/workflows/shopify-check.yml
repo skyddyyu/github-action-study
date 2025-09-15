@@ -1,0 +1,129 @@
+name: Check Shopify Products on PR
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+jobs:
+  check-products:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (none required)
+        run: |
+          node -v
+
+      - name: Count Shopify products via Storefront API
+        id: count
+        env:
+          SHOPIFY_STORE_DOMAIN: ${{ secrets.SHOPIFY_STORE_DOMAIN }}
+          SHOPIFY_STOREFRONT_ACCESS_TOKEN: ${{ secrets.SHOPIFY_STOREFRONT_ACCESS_TOKEN }}
+          SHOPIFY_API_VERSION: "2024-10"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+          domain="${SHOPIFY_STORE_DOMAIN#http://}"
+          domain="${domain#https://}"
+          domain="${domain%/}"
+          api_version="${SHOPIFY_API_VERSION:-2024-10}"
+          endpoint="https://${domain}/api/${api_version}/graphql.json"
+
+          query='query ProductsPage($pageSize: Int!, $after: String) { products(first: $pageSize, after: $after) { edges { cursor } pageInfo { hasNextPage } } }'
+
+          pageSize=250
+          cap=25001
+          count=0
+          truncated=false
+          after_json="null"
+
+          while :; do
+            body=$(jq -n --arg q "$query" --argjson ps $pageSize --argjson a "$after_json" '{query:$q, variables:{pageSize:$ps, after:$a}}')
+
+            resp=$(curl -sS -X POST "$endpoint" \
+              -H "Content-Type: application/json" \
+              -H "X-Shopify-Storefront-Access-Token: $SHOPIFY_STOREFRONT_ACCESS_TOKEN" \
+              --data "$body")
+
+            if [ "$(echo "$resp" | jq -r 'has("errors")')" = "true" ]; then
+              echo "Storefront API errors: $(echo "$resp" | jq -c .errors)"
+              exit 1
+            fi
+
+            edges_count=$(echo "$resp" | jq -r '.data.products.edges | length')
+            hasNext=$(echo "$resp" | jq -r '.data.products.pageInfo.hasNextPage')
+
+            count=$((count + edges_count))
+
+            if [ "$count" -ge "$cap" ]; then
+              count=$cap
+              truncated=true
+              break
+            fi
+
+            if [ "$hasNext" != "true" ] || [ "$edges_count" -eq 0 ]; then
+              break
+            fi
+
+            cursor=$(echo "$resp" | jq -r '.data.products.edges[-1].cursor // empty')
+            if [ -n "$cursor" ]; then
+              after_json=$(jq -Rn --arg s "$cursor" '$s')
+            else
+              after_json="null"
+            fi
+          done
+
+          summary="Shopify store \"${domain}\" product count: ${count}"
+          if [ "$truncated" = "true" ]; then
+            summary="${summary} (truncated at 25,001)"
+          fi
+
+          echo "$summary"
+
+          {
+            echo "count=${count}"
+            echo "truncated=${truncated}"
+            echo "summary<<EOF"
+            echo "$summary"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR if products exist
+        if: ${{ success() && steps.count.outputs.count && steps.count.outputs.count != '0' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const count = parseInt(process.env.count || '0', 10);
+            const truncated = (process.env.truncated || 'false') === 'true';
+            const lines = [];
+            lines.push(`✅ Shopify 商品数量：${count}${truncated ? '（已在 25,001 处截断）' : ''}`);
+            if (count > 0) {
+              lines.push('有足够的商品可以操作。');
+            }
+            const body = lines.join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+          result-encoding: string
+        env:
+          count: ${{ steps.count.outputs.count }}
+          truncated: ${{ steps.count.outputs.truncated }}
+
+      - name: Set job summary
+        if: always()
+        run: |
+          echo "${{ steps.count.outputs.summary }}" >> $GITHUB_STEP_SUMMARY
